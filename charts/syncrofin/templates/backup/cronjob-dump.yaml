@@ -1,0 +1,61 @@
+{{- if and .Values.backup.enabled .Values.postgresql.enabled }}
+# E2 — pg_dump diário (gzip, texto puro: restaura com psql). Retenção por idade.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "syncrofin.fullname" . }}-db-dump
+  labels:
+    {{- include "syncrofin.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.dump.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "syncrofin.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: dump
+              image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+              imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  mkdir -p /backups/dumps
+                  F=/backups/dumps/dump_$(date +%Y%m%d_%H%M%S).sql.gz
+                  # grava em .tmp e renomeia: um dump interrompido nunca aparece como válido
+                  pg_dump | gzip > "$F.tmp"
+                  mv "$F.tmp" "$F"
+                  echo "dump concluído: $F"
+                  find /backups/dumps -name 'dump_*.sql.gz' -mtime +"$KEEP_DAYS" -delete
+              env:
+                - name: PGHOST
+                  value: {{ include "syncrofin.fullname" . }}-postgresql
+                - name: PGUSER
+                  value: postgres
+                - name: PGDATABASE
+                  value: syncrofin
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "syncrofin.fullname" . }}-postgresql
+                      key: password
+                - name: KEEP_DAYS
+                  value: {{ .Values.backup.dump.keepDays | quote }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "syncrofin.fullname" . }}-backups
+{{- end }}

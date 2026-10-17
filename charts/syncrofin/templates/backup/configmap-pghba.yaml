@@ -1,0 +1,22 @@
+{{- if and .Values.backup.enabled .Values.postgresql.enabled }}
+# pg_hba.conf = o padrão do initdb + replicação a partir do cluster, necessária ao
+# pg_basebackup do CronJob. Só é aplicado com backup.enabled (hba_file no StatefulSet).
+# A autenticação continua sendo por senha (scram-sha-256); proteja o tráfego com NetworkPolicy.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "syncrofin.fullname" . }}-postgresql-hba
+  labels:
+    {{- include "syncrofin.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+data:
+  pg_hba.conf: |
+    local   all             all                                     trust
+    host    all             all             127.0.0.1/32            trust
+    host    all             all             ::1/128                 trust
+    local   replication     all                                     trust
+    host    replication     all             127.0.0.1/32            trust
+    host    replication     all             ::1/128                 trust
+    host    replication     all             all                     scram-sha-256
+    host    all             all             all                     scram-sha-256
+{{- end }}

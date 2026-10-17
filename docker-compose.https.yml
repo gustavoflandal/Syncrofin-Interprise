@@ -1,0 +1,51 @@
+# HTTPS na frente do SyncroFin, com certificado Let's Encrypt emitido e renovado
+# automaticamente pelo Caddy. Usar junto com o compose de produção:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.https.yml up -d
+#
+# Pré-requisitos (passo a passo em docs/DEPLOYMENT.md, seção "HTTPS"):
+#   - um domínio apontando (registro A/AAAA) para o IP deste servidor;
+#   - as portas 80 e 443 liberadas para a internet;
+#   - no .env: DOMAIN=syncrofin.exemplo.com
+#
+# Requer Docker Compose 2.24 ou mais novo (usa `!reset`).
+
+x-https-env: &https-env
+  # A URL pública passa a ser a do domínio: CORS, links dos e-mails e passkeys.
+  FRONTEND_URL: https://${DOMAIN:?defina DOMAIN no .env}
+  # Cadeia agora é: navegador -> Caddy -> nginx do frontend -> backend. São dois
+  # proxies, e o limitador de tentativas precisa contar os dois para enxergar o IP real.
+  TRUSTED_PROXY_HOPS: "2"
+
+services:
+  caddy:
+    image: docker.io/library/caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      DOMAIN: ${DOMAIN:?defina DOMAIN no .env}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Guarda os certificados: sem isso cada reinício pede um novo e o Let's Encrypt limita.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+
+  # Só o Caddy fica exposto: o app e a API deixam de ser publicados no host.
+  frontend:
+    ports: !reset []
+  backend:
+    ports: !reset []
+    environment: *https-env
+  celery-worker:
+    environment: *https-env
+  celery-beat:
+    environment: *https-env
+
+volumes:
+  caddy_data:
+  caddy_config:

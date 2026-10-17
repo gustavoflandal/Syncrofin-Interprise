@@ -1,0 +1,31 @@
+apiVersion: v2
+name: syncrofin
+description: A Helm chart for SyncroFin, an open-source personal finance application.
+type: application
+version: 0.16.0
+appVersion: "0.16.0"
+icon: https://raw.githubusercontent.com/gustavoflandal/SyncroFin/main/favicons/android-icon-192x192.png
+home: https://github.com/gustavoflandal/SyncroFin
+sources:
+  - https://github.com/gustavoflandal/SyncroFin
+keywords:
+  - finance
+  - accounting
+  - syncrofin
+annotations:
+  # Artifact Hub only accepts ai-machine-learning, database,
+  # integration-delivery, monitoring-logging, networking, security, storage or
+  # streaming-messaging, and none of them describe a personal finance app. An
+  # invalid value fails the whole package, and omitting the field entirely lets
+  # Artifact Hub predict one from the keywords, which would be just as wrong,
+  # so opt out of the prediction instead.
+  artifacthub.io/category: skip-prediction
+  artifacthub.io/license: "AGPL-3.0"
+  artifacthub.io/images: |
+    - name: syncrofin-enterprise-backend
+      image: ghcr.io/gustavoflandal/syncrofin-enterprise-backend:latest
+    - name: syncrofin-enterprise-frontend
+      image: ghcr.io/gustavoflandal/syncrofin-enterprise-frontend:latest
+  artifacthub.io/links: |
+    - name: Source
+      url: https://github.com/gustavoflandal/SyncroFin

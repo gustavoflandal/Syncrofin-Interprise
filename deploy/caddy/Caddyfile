@@ -1,0 +1,16 @@
+# Proxy reverso com HTTPS automático para o SyncroFin.
+# Usado por docker-compose.https.yml. Passo a passo: docs/DEPLOYMENT.md (seção "HTTPS")
+# e o tópico "Publicar com HTTPS" do manual.
+#
+# DOMAIN  domínio público que aponta para este servidor (ex.: syncrofin.exemplo.com)
+#
+# O certificado (Let's Encrypt) é emitido e renovado sozinho, sem e-mail de cadastro.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Diz ao navegador para usar sempre HTTPS neste domínio.
+	header Strict-Transport-Security "max-age=31536000"
+
+	# O nginx do frontend (porta 8080) serve o app e repassa /api ao backend.
+	reverse_proxy frontend:8080
+}

@@ -1,0 +1,15 @@
+{{- if and .Values.celeryWorker.enabled (and .Values.celeryWorker.replicaCount (gt (int .Values.celeryWorker.replicaCount) 1)) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "syncrofin.fullname" . }}-worker
+  labels:
+    {{- include "syncrofin.labels" . | nindent 4 }}
+    app.kubernetes.io/component: celery-worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "syncrofin.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: celery-worker
+{{- end }}

@@ -1,0 +1,94 @@
+{{- if .Values.postgresql.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "syncrofin.fullname" . }}-postgresql
+  labels:
+    {{- include "syncrofin.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  serviceName: {{ include "syncrofin.fullname" . }}-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "syncrofin.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+  template:
+    metadata:
+      labels:
+        {{- include "syncrofin.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgresql
+    spec:
+      {{- if .Values.backup.enabled }}
+      # E2: o volume de backups precisa ser gravável pelo usuário postgres (gid 999 na imagem)
+      securityContext:
+        fsGroup: 999
+      {{- end }}
+      containers:
+        - name: postgresql
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          {{- if .Values.backup.enabled }}
+          # E2: arquivamento contínuo de WAL para o PVC de backups (base do PITR, RPO <= 15 min)
+          # + pg_hba com replicação para o pg_basebackup do CronJob.
+          args:
+            - postgres
+            - -c
+            - wal_level=replica
+            - -c
+            - archive_mode=on
+            - -c
+            - archive_command=mkdir -p /backups/wal && test ! -f /backups/wal/%f && cp %p /backups/wal/%f
+            - -c
+            - archive_timeout=300
+            - -c
+            - hba_file=/etc/postgresql-hba/pg_hba.conf
+          {{- end }}
+          ports:
+            - name: tcp-postgresql
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "syncrofin.fullname" . }}-postgresql
+                  key: password
+            - name: POSTGRES_DB
+              value: syncrofin
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            {{- if .Values.backup.enabled }}
+            - name: backups
+              mountPath: /backups
+            - name: pg-hba
+              mountPath: /etc/postgresql-hba
+              readOnly: true
+            {{- end }}
+          {{- if .Values.postgresql.resources }}
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+          {{- end }}
+      {{- if .Values.backup.enabled }}
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: {{ include "syncrofin.fullname" . }}-backups
+        - name: pg-hba
+          configMap:
+            name: {{ include "syncrofin.fullname" . }}-postgresql-hba
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 8Gi
+{{- end }}

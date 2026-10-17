@@ -1,0 +1,15 @@
+{{- if and .Values.frontend.replicaCount (gt (int .Values.frontend.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "syncrofin.fullname" . }}-frontend
+  labels:
+    {{- include "syncrofin.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "syncrofin.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: frontend
+{{- end }}

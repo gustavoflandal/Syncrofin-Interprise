@@ -1,0 +1,380 @@
+# The Enterprise edition has its own Compose project, database, volumes and host ports, so it can run
+# next to the Community edition on the same machine without either touching the other's data.
+name: syncrofin-enterprise
+
+# podman-compose groups all services into a single pod by default, which
+# interferes with per-service port mapping and networking. Disabling it makes
+# podman-compose behave like Docker Compose. Docker ignores unknown top-level
+# x- keys.
+x-podman:
+  in_pod: false
+
+x-backend-env: &backend-env
+  # No defaults for the three secrets: the stack does not start without them, and the backend refuses
+  # the values that are printed in this repository (app/core/secrets_guard.py). `install.sh` generates them.
+  DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (openssl rand -hex 24)}@db:5432/syncrofin_enterprise
+  SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env (openssl rand -hex 32)}
+  DEBUG: ${DEBUG:-false}
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-3100}}
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  PLUGGY_CLIENT_ID: ${PLUGGY_CLIENT_ID:-}
+  PLUGGY_CLIENT_SECRET: ${PLUGGY_CLIENT_SECRET:-}
+  PLUGGY_OAUTH_REDIRECT_URI: ${PLUGGY_OAUTH_REDIRECT_URI:-}
+  ENABLE_BANKING_APP_ID: ${ENABLE_BANKING_APP_ID:-}
+  ENABLE_BANKING_PRIVATE_KEY_FILE: ${ENABLE_BANKING_PRIVATE_KEY_FILE:-/app/secrets/enable_banking_private.pem}
+  ENABLE_BANKING_API_URL: ${ENABLE_BANKING_API_URL:-https://api.enablebanking.com}
+  ENABLE_BANKING_OAUTH_REDIRECT_URI: ${ENABLE_BANKING_OAUTH_REDIRECT_URI:-}
+  SIMPLEFIN_ENABLED: ${SIMPLEFIN_ENABLED:-false}
+  SIMPLEFIN_API_URL: ${SIMPLEFIN_API_URL:-https://beta-bridge.simplefin.org}
+  OIDC_ENABLED: ${OIDC_ENABLED:-false}
+  OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:-OIDC}
+  OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+  OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+  OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+  OIDC_SCOPES: ${OIDC_SCOPES:-openid email profile}
+  OIDC_AUTO_REGISTER: ${OIDC_AUTO_REGISTER:-true}
+  OIDC_EXISTING_USER_LINK_MODE: ${OIDC_EXISTING_USER_LINK_MODE:-disabled}
+  OIDC_REQUIRE_VERIFIED_EMAIL: ${OIDC_REQUIRE_VERIFIED_EMAIL:-true}
+  OIDC_SYNC_ROLES: ${OIDC_SYNC_ROLES:-false}
+  OIDC_ROLES_CLAIM: ${OIDC_ROLES_CLAIM:-groups}
+  OIDC_ADMIN_ROLES: ${OIDC_ADMIN_ROLES:-}
+  OIDC_WORKSPACE_ROLE_MAP: ${OIDC_WORKSPACE_ROLE_MAP:-}
+  # SAML 2.0 SSO (C6) — for enterprise IdPs that speak SAML instead of OIDC.
+  SAML_ENABLED: ${SAML_ENABLED:-false}
+  SAML_PROVIDER_NAME: ${SAML_PROVIDER_NAME:-SAML}
+  SAML_IDP_METADATA_URL: ${SAML_IDP_METADATA_URL:-}
+  SAML_SP_ENTITY_ID: ${SAML_SP_ENTITY_ID:-}
+  SAML_SP_CERT: ${SAML_SP_CERT:-}
+  SAML_SP_KEY: ${SAML_SP_KEY:-}
+  SAML_AUTO_REGISTER: ${SAML_AUTO_REGISTER:-true}
+  SAML_NAME_ID_FORMAT: ${SAML_NAME_ID_FORMAT:-urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress}
+  SAML_SYNC_ROLES: ${SAML_SYNC_ROLES:-false}
+  SAML_ROLES_ATTRIBUTE: ${SAML_ROLES_ATTRIBUTE:-Role}
+  SAML_ADMIN_ROLES: ${SAML_ADMIN_ROLES:-}
+  SAML_WORKSPACE_ROLE_MAP: ${SAML_WORKSPACE_ROLE_MAP:-}
+  # SCIM 2.0 provisioning (C6) — server-to-server user lifecycle.
+  SCIM_ENABLED: ${SCIM_ENABLED:-false}
+  SCIM_BEARER_TOKEN: ${SCIM_BEARER_TOKEN:-}
+  SCIM_DEFAULT_WORKSPACE_ID: ${SCIM_DEFAULT_WORKSPACE_ID:-}
+  SCIM_AUTO_ACTIVATE: ${SCIM_AUTO_ACTIVATE:-true}
+  LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-true}
+  OPENEXCHANGERATES_APP_ID: ${OPENEXCHANGERATES_APP_ID:-}
+  FX_SYNC_MODE: ${FX_SYNC_MODE:-on_demand}
+  TESOURO_DIRETO_ENABLED: ${TESOURO_DIRETO_ENABLED:-true}
+  # Outbound notification channels (optional). The in-app inbox always works;
+  # e-mail needs SMTP_HOST + SMTP_FROM, the webhook needs its URL.
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-}
+  SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+  NOTIFICATIONS_WEBHOOK_URL: ${NOTIFICATIONS_WEBHOOK_URL:-}
+  NOTIFICATIONS_WEBHOOK_SECRET: ${NOTIFICATIONS_WEBHOOK_SECRET:-}
+  # The backend is reached through the bundled nginx frontend below, so rate
+  # limiting needs to trust exactly one reverse-proxy hop to key by real
+  # client IP instead of nginx's own container address.
+  TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
+  # Sessions: a short access token renewed by a revocable refresh cookie.
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+  SESSION_IDLE_DAYS: ${SESSION_IDLE_DAYS:-7}
+  SESSION_MAX_DAYS: ${SESSION_MAX_DAYS:-30}
+  # Second factor: `true` makes it mandatory for everyone at once. Off by default; an administrator
+  # can also require it from the panel, with a grace period.
+  REQUIRE_MFA: ${REQUIRE_MFA:-false}
+  MFA_GRACE_DAYS: ${MFA_GRACE_DAYS:-7}
+  # Passwords and lockout: the minimum length of a new password, and how many wrong ones in a row lock an
+  # account (first pause in minutes; it doubles each time, capped at an hour).
+  PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-10}
+  LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+  LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+  # How long access records are kept before they are anonymised (183 to 3650 days; the panel can override it).
+  ACCESS_LOG_RETENTION_DAYS: ${ACCESS_LOG_RETENTION_DAYS:-183}
+  REDIS_URL: redis://redis:6379/0
+  # Structured JSON logging for log aggregators (Loki, CloudWatch, etc.)
+  STRUCTURED_LOGGING: ${STRUCTURED_LOGGING:-false}
+  # Storage: 'local' (default) or 's3'.  S3 vars below are only needed when STORAGE_PROVIDER=s3.
+  STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+  FISCAL_RETENTION_YEARS: ${FISCAL_RETENTION_YEARS:-5}
+  STORAGE_LOCAL_PATH: /app/data/attachments
+  STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-}
+  STORAGE_S3_REGION: ${STORAGE_S3_REGION:-}
+  STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-}
+  STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-}
+  STORAGE_S3_ENDPOINT_URL: ${STORAGE_S3_ENDPOINT_URL:-}
+  AGENTS_KNOWLEDGE_STORAGE_PATH: /app/data/agent_knowledge
+  # Agents/LLM feature — opt-in. Off by default so existing users pay
+  # zero cost. Run `docker compose -f docker-compose.prod.yml --profile
+  # agents up` after enabling.
+  AGENTS_ENABLED: ${AGENTS_ENABLED:-false}
+  AGENTS_BUILTIN_MCP_URL: ${AGENTS_BUILTIN_MCP_URL:-http://mcp-server:8765/mcp}
+  AGENTS_EXTRA_MCP_SERVERS: ${AGENTS_EXTRA_MCP_SERVERS:-}
+  # Empty is fine while agents are off; with AGENTS_ENABLED=true the backend refuses to start without it.
+  AGENTS_MCP_JWT_SECRET: ${AGENTS_MCP_JWT_SECRET:-}
+  # TTL for tokens minted from /agents/connections → "External MCP access".
+  # Used by Claude Desktop, n8n, custom clients plugging into SyncroFin.
+  AGENTS_MCP_EXTERNAL_TTL_DAYS: ${AGENTS_MCP_EXTERNAL_TTL_DAYS:-90}
+  # LLM provider config — only the provider you actually use needs setting.
+  AGENTS_DEFAULT_PROVIDER: ${AGENTS_DEFAULT_PROVIDER:-ollama}
+  AGENTS_DEFAULT_MODEL: ${AGENTS_DEFAULT_MODEL:-}
+  AGENTS_OLLAMA_BASE_URL: ${AGENTS_OLLAMA_BASE_URL:-http://ollama:11434}
+  AGENTS_OPENAI_API_KEY: ${AGENTS_OPENAI_API_KEY:-}
+  AGENTS_ANTHROPIC_API_KEY: ${AGENTS_ANTHROPIC_API_KEY:-}
+  AGENTS_OPENAI_COMPAT_BASE_URL: ${AGENTS_OPENAI_COMPAT_BASE_URL:-}
+  AGENTS_OPENAI_COMPAT_API_KEY: ${AGENTS_OPENAI_COMPAT_API_KEY:-}
+  # Knowledge-base embeddings. `native` (default) uses fastembed with a
+  # bundled multilingual model — zero external setup. Override with
+  # ollama/openai/openai_compatible for better quality.
+  AGENTS_EMBEDDING_PROVIDER: ${AGENTS_EMBEDDING_PROVIDER:-native}
+  AGENTS_EMBEDDING_MODEL: ${AGENTS_EMBEDDING_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+  # Observabilidade (E5) — JSON em produção por padrão
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # Tracing OpenTelemetry (E5) — vazio = desligado
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-syncrofin-backend}
+  OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}
+
+x-backend-base: &backend-base
+  image: ghcr.io/gustavoflandal/syncrofin-enterprise-backend:latest
+  environment: *backend-env
+  # Lets a connection point at a model server running on the host (LM Studio,
+  # Ollama, llama.cpp) as http://host.docker.internal:<port>. Docker Desktop
+  # resolves the name on its own; this makes it work on Linux too.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    db: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  volumes:
+    - ./secrets:/app/secrets:ro
+    - attachments:/app/data/attachments
+    - agent_knowledge:/app/data/agent_knowledge
+    - agent_embedding_models:/app/data/embedding_models
+  restart: unless-stopped
+
+services:
+  redis:
+    image: docker.io/library/redis:8-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  db:
+    # docker.io/pgvector/pgvector:pg16 is a drop-in replacement for postgres:16
+    # that bundles the pgvector extension, required by the agents
+    # knowledge-base (RAG) migration introduced in v0.11.0.
+    image: ${DB_IMAGE:-docker.io/pgvector/pgvector:pg16}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (openssl rand -hex 24)}
+      POSTGRES_DB: syncrofin_enterprise
+    # E2 — arquivamento contínuo de WAL (base do PITR, RPO <= 15 min): cada segmento
+    # concluído, ou a cada archive_timeout segundos, é copiado para o volume `pgwal`.
+    # `test ! -f` nunca sobrescreve um segmento já arquivado. O volume é preparado
+    # (dono postgres) pelo serviço `db-init-wal`. Sem o profile `backup` o arquivo de
+    # WAL não é podado: ative o profile (db-basebackup faz a poda) ou limpe o volume.
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
+      - -c
+      - archive_timeout=300
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgwal:/wal_archive
+    depends_on:
+      db-init-wal: { condition: service_completed_successfully }
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Volumes nomeados nascem como root; o archive_command roda como postgres (uid 999
+  # na imagem oficial), então o volume do WAL precisa de dono antes do db subir.
+  db-init-wal:
+    image: ${DB_IMAGE:-docker.io/pgvector/pgvector:pg16}
+    user: root
+    entrypoint: ["sh", "-c", "chown postgres:postgres /wal_archive && chmod 700 /wal_archive"]
+    volumes:
+      - pgwal:/wal_archive
+    restart: "no"
+
+  # E8 — zero-downtime migrations: run Alembic once as a separate service
+  # before the backend starts, so restarts/replicas don't race on migrations.
+  db-migrate:
+    <<: *backend-base
+    command: alembic upgrade head
+    restart: "no"
+
+  backend:
+    <<: *backend-base
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      db-migrate: { condition: service_completed_successfully }
+    ports:
+      - "${BACKEND_PORT:-8100}:8000"
+
+  frontend:
+    image: ghcr.io/gustavoflandal/syncrofin-enterprise-frontend:latest
+    ports:
+      - "${FRONTEND_PORT:-3100}:8080"
+    environment:
+      BACKEND_URL: http://backend:8000
+      UPLOAD_MAX_BODY_SIZE: ${UPLOAD_MAX_BODY_SIZE:-50m}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-3100}}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  celery-worker:
+    <<: *backend-base
+    # Limit to 2 workers to save RAM (default = number of CPUs).
+    command: celery -A app.worker worker --loglevel=info --concurrency=2
+
+  celery-beat:
+    <<: *backend-base
+    # --pidfile= (empty) avoids stale PID files in ephemeral containers.
+    command: celery -A app.worker beat --loglevel=info --pidfile=
+
+  # ─── Backup automático do Postgres (E2) ──────────────────────────────────
+  # Roda sob o profile `backup` (inativo por padrão) OU pode ser iniciado
+  # isoladamente com `docker compose run --rm db-backup`.
+  #
+  # O serviço executa pg_dump a cada BACKUP_CRON (padrão: diário à 02:00) e
+  # comprime o dump em /backups. Mantenha no mínimo BACKUP_KEEP_DAYS dumps;
+  # os mais antigos são apagados automaticamente.
+  #
+  # Para habilitar automaticamente: adicione `--profile backup` ao Compose ou
+  # adicione `backup` em COMPOSE_PROFILES no .env.
+  #
+  # Para restaurar um dump:
+  #   docker compose exec db psql -U postgres syncrofin_enterprise < /backups/<arquivo>.sql
+  db-backup:
+    image: docker.io/pgvector/pgvector:pg16
+    profiles: [backup]
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      BACKUP_CRON: ${BACKUP_CRON:-0 2 * * *}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      POSTGRES_HOST: db
+      POSTGRES_USER: postgres
+      POSTGRES_DB: syncrofin_enterprise
+    volumes:
+      - pgbackups:/backups
+    depends_on:
+      db: { condition: service_healthy }
+    # supercronic is not available in the postgres image; use a shell loop instead.
+    # The loop sleeps until the next whole minute and evaluates the cron expression
+    # against the current time with a simple minute-precision check.  For production
+    # use a dedicated cron-capable image (e.g. mcuadros/ofelia or Ofelia via labels).
+    entrypoint: >
+      sh -c '
+        set -e
+        mkdir -p /backups
+        echo "db-backup: schedule=$$BACKUP_CRON keep=$$BACKUP_KEEP_DAYS days"
+        while true; do
+          NOW=$$(date +"%H:%M")
+          SCHED=$$(echo "$$BACKUP_CRON" | awk "{print \$$2\":\"\$$1}" | sed "s/^/0/;s/0\([0-9][0-9]\)/\1/")
+          if [ "$$NOW" = "$$SCHED" ]; then
+            FNAME="$$(date +%Y%m%d_%H%M%S).sql.gz"
+            echo "db-backup: dumping → /backups/$$FNAME"
+            pg_dump -h $$POSTGRES_HOST -U $$POSTGRES_USER $$POSTGRES_DB | gzip > /backups/$$FNAME
+            echo "db-backup: done ($$FNAME)"
+            # Remove dumps older than BACKUP_KEEP_DAYS
+            find /backups -name "*.sql.gz" -mtime +$$BACKUP_KEEP_DAYS -delete
+            sleep 61
+          fi
+          sleep 30
+        done
+      '
+
+  # ─── Base backup semanal + poda do WAL (E2 — PITR) ───────────────────────
+  # Junto com o WAL arquivado em `pgwal`, o base backup permite restaurar o banco
+  # em qualquer instante posterior a ele (--target-time do restore_drill.sh).
+  # Roda no namespace de rede do `db` e conecta em 127.0.0.1: o pg_hba padrão da
+  # imagem já aceita replicação local, sem abrir replicação para a rede.
+  # Faz um base backup ao subir (se o último tiver mais de BASEBACKUP_INTERVAL_DAYS)
+  # e depois confere a cada hora. Mantém BACKUP_KEEP_BASEBACKUPS e apaga WAL mais
+  # antigo que o base backup mais velho retido (com 1 h de folga).
+  db-basebackup:
+    image: ${DB_IMAGE:-docker.io/pgvector/pgvector:pg16}
+    profiles: [backup]
+    restart: unless-stopped
+    network_mode: "service:db"
+    environment:
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      BACKUP_KEEP_BASEBACKUPS: ${BACKUP_KEEP_BASEBACKUPS:-4}
+      BASEBACKUP_INTERVAL_DAYS: ${BASEBACKUP_INTERVAL_DAYS:-7}
+    volumes:
+      - pgbasebackups:/backups
+      - pgwal:/wal_archive
+    depends_on:
+      db: { condition: service_healthy }
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -uo pipefail
+        mkdir -p /backups
+        while true; do
+          LAST=$$(ls -1dt /backups/base_* 2>/dev/null | grep -v '\.partial$$' | head -n1 || true)
+          if [ -z "$$LAST" ] || [ -n "$$(find "$$LAST" -maxdepth 0 -mtime +$$((BASEBACKUP_INTERVAL_DAYS-1)))" ]; then
+            DEST=/backups/base_$$(date +%Y%m%d_%H%M%S)
+            echo "[basebackup] iniciando em $$DEST"
+            # .partial evita que o restore_drill use um backup incompleto
+            if pg_basebackup -D "$$DEST.partial" -Ft -z -Xs -P; then
+              mv "$$DEST.partial" "$$DEST"
+              echo "[basebackup] concluído: $$DEST"
+            else
+              echo "[basebackup] FALHOU" >&2; rm -rf "$$DEST.partial"
+            fi
+            ls -1dt /backups/base_* 2>/dev/null | grep -v '\.partial$$' | tail -n +$$((BACKUP_KEEP_BASEBACKUPS+1)) | xargs -r rm -rf
+            OLDEST=$$(ls -1dt /backups/base_* 2>/dev/null | grep -v '\.partial$$' | tail -n1 || true)
+            if [ -n "$$OLDEST" ]; then
+              AGE_MIN=$$(( ($$(date +%s) - $$(stat -c %Y "$$OLDEST")) / 60 + 60 ))
+              find /wal_archive -type f -mmin +$$AGE_MIN -delete
+            fi
+          fi
+          sleep 3600
+        done
+
+  # Optional: SyncroFin built-in MCP server. Only starts under the `agents`
+  # profile (`docker compose -f docker-compose.prod.yml --profile agents up`).
+  # Reuses the backend image, just runs a different uvicorn entry point.
+  # Modular by design — users not using the agents feature pay zero cost.
+  #
+  # The port is published on the host (127.0.0.1 by default) so external
+  # agents — Claude Desktop, n8n, custom clients — can reach it after
+  # minting a token from the UI. JWT auth is always required. Override
+  # AGENTS_MCP_EXTERNAL_HOST_PORT to e.g. "0.0.0.0:8765" to expose to LAN.
+  mcp-server:
+    <<: *backend-base
+    profiles: [agents]
+    command: uvicorn mcp_server.main:app --host 0.0.0.0 --port 8765
+    ports:
+      - "${AGENTS_MCP_EXTERNAL_HOST_PORT:-127.0.0.1:8765}:8765"
+
+volumes:
+  pgdata:
+  pgbackups:
+  pgbasebackups:
+  pgwal:
+  attachments:
+  agent_knowledge:
+  agent_embedding_models:

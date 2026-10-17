@@ -1,0 +1,678 @@
+import os
+import uuid
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from typing import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# --- Agents test setup (must run BEFORE app.main is imported) ---------------
+# Force the optional agents feature on for the test process so the routes
+# are mounted and the agent models are reachable. Provide deterministic
+# JWT/MCP secrets so test fixtures can mint tokens.
+os.environ.setdefault("AGENTS_ENABLED", "true")
+os.environ.setdefault("AGENTS_MCP_JWT_SECRET", "test-secret-not-for-production")
+os.environ.setdefault("AGENTS_BUILTIN_MCP_URL", "http://test-mcp:8765/mcp")
+# Tests use synthetic credentials, never local deployment secrets. Explicit
+# Settings(_secrets_dir=...) tests still exercise secret-file loading.
+os.environ["SECRET_KEY"] = "synthetic-test-signing-key-not-for-production"
+os.environ["CREDENTIALS_DIRECTORY"] = ""
+
+# --- Real PostgreSQL --------------------------------------------------------
+# The suite runs against a real PostgreSQL with the pgvector extension, the
+# same engine production uses. There is deliberately no SQLite fallback: it
+# hid Postgres-only behaviour (`to_char`, collation, foreign keys, pgvector)
+# behind shims and skipped tests, and a green run said less than it appeared to.
+#
+# Start one with `docker compose -f docker-compose.test.yml up -d` (port 55433)
+# or point TEST_DATABASE_URL at any server where the user may CREATE DATABASE
+# and CREATE EXTENSION. Each pytest-xdist worker gets its own database, so
+# `-n 4` workers never see each other's rows.
+import asyncio  # noqa: E402
+
+import asyncpg  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
+
+_ADMIN_URL = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:55433/postgres"
+)
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "main")
+_TEST_DB_NAME = f"syncrofin_test_{_WORKER}"
+
+
+def _prepare_database() -> str:
+    """Create this worker's database if needed and return its URL.
+
+    Runs at import time, before `app` is imported, because the application
+    builds its own engine from DATABASE_URL when it loads.
+    """
+    admin = make_url(_ADMIN_URL)
+
+    async def create() -> None:
+        conn = await asyncpg.connect(
+            user=admin.username,
+            password=admin.password,
+            host=admin.host,
+            port=admin.port or 5432,
+            database=admin.database or "postgres",
+        )
+        try:
+            exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", _TEST_DB_NAME)
+            if not exists:
+                await conn.execute(f'CREATE DATABASE "{_TEST_DB_NAME}"')
+        finally:
+            await conn.close()
+
+    try:
+        asyncio.run(create())
+    except (OSError, asyncpg.PostgresError) as exc:  # pragma: no cover - environment problem
+        raise RuntimeError(
+            "The test suite needs a real PostgreSQL (with pgvector).\n"
+            "  docker compose -f docker-compose.test.yml up -d\n"
+            f"Could not reach {admin.host}:{admin.port} ({exc})."
+        ) from exc
+    return admin.set(database=_TEST_DB_NAME).render_as_string(hide_password=False)
+
+
+TEST_DATABASE_URL = _prepare_database()
+# The application's own engine (used by code that opens its own sessions, such
+# as background tasks) must point at the same database as the fixtures.
+os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker  # noqa: E402
+
+from app.core.database import Base, get_async_session  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models.user import User  # noqa: E402
+from app.models.passkey import UserPasskey  # noqa: E402,F401
+from app.models.category import Category  # noqa: E402
+from app.models.bank_connection import BankConnection  # noqa: E402
+from app.models.account import Account  # noqa: E402
+from app.models.transaction import Transaction  # noqa: E402
+from app.models.rule import Rule  # noqa: E402
+from app.models.asset import Asset  # noqa: E402,F401
+from app.models.asset_value import AssetValue  # noqa: E402,F401
+from app.models.transaction_attachment import TransactionAttachment  # noqa: E402,F401
+from app.models.payee import Payee, PayeeMapping  # noqa: E402,F401
+from app.models.app_settings import AppSetting  # noqa: E402,F401
+from app.models.goal import Goal  # noqa: E402,F401
+from app.models.credit_card_bill import CreditCardBill  # noqa: E402,F401
+from app.models.group import Group, GroupMember  # noqa: E402,F401
+from app.models.transaction_split import TransactionSplit  # noqa: E402,F401
+from app.models.group_settlement import GroupSettlement  # noqa: E402,F401
+from app.models.workspace import Workspace, WorkspaceMember  # noqa: E402,F401
+# Agent models — gated by AGENTS_ENABLED above so tests always cover them.
+from app.agents.models import (  # noqa: E402,F401
+    Agent,
+    AgentTool,
+    Conversation,
+    Message,
+    KnowledgeDoc,
+    KnowledgeChunk,
+    LlmUsage,
+)
+
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.pool import NullPool  # noqa: E402
+
+# NullPool: the suite shares one session-scoped event loop, and a pooled asyncpg
+# connection is bound to the loop that opened it. Opening a connection per use
+# is cheap against a local Postgres and rules out cross-loop reuse.
+engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
+TestSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session", autouse=True)
+async def setup_database():
+    """Build the schema once per worker, from the models, on a clean database."""
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session() -> AsyncGenerator[AsyncSession, None]:
+    """Provide a transactional test session that rolls back after each test."""
+    async with TestSessionLocal() as session:
+        yield session
+        # Roll back any uncommitted changes
+        await session.rollback()
+
+
+@pytest_asyncio.fixture
+async def clean_db(session: AsyncSession):
+    """Empty every table between tests.
+
+    One TRUNCATE ... CASCADE rather than a DELETE per table: it needs no
+    dependency ordering, resets sequences, and is faster on ~100 tables.
+    """
+    names = ", ".join(f'"{table.name}"' for table in Base.metadata.sorted_tables)
+    # The audit trail refuses TRUNCATE (that is its job); switch its guards off for the test's sake.
+    await session.execute(text("ALTER TABLE audit_events DISABLE TRIGGER USER"))
+    await session.execute(text(f"TRUNCATE TABLE {names} RESTART IDENTITY CASCADE"))
+    await session.execute(text("ALTER TABLE audit_events ENABLE TRIGGER USER"))
+    await session.commit()
+
+
+async def override_get_async_session() -> AsyncGenerator[AsyncSession, None]:
+    async with TestSessionLocal() as session:
+        yield session
+
+
+# Override the dependency
+app.dependency_overrides[get_async_session] = override_get_async_session
+
+
+@pytest_asyncio.fixture
+async def client() -> AsyncGenerator[AsyncClient, None]:
+    """Provide an async test client."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.fixture
+def oidc_only_settings():
+    """Enable a complete OIDC-only policy and restore only changed keys."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    previous = {
+        "oidc_enabled": settings.oidc_enabled,
+        "oidc_discovery_url": settings.oidc_discovery_url,
+        "oidc_client_id": settings.oidc_client_id,
+        "local_auth_enabled": settings.local_auth_enabled,
+    }
+    settings.oidc_enabled = True
+    settings.oidc_discovery_url = "https://id.example.com/.well-known/openid-configuration"
+    settings.oidc_client_id = "syncrofin"
+    settings.local_auth_enabled = False
+    yield settings
+    for key, value in previous.items():
+        setattr(settings, key, value)
+
+
+async def issue_test_token(user: User, *, mfa_verified: bool = False, method: str = "password") -> str:
+    """An access token backed by a real session, for tests that skip the login form."""
+    from app.services import session_service
+    from app.models.user_session import UserSession
+    from datetime import datetime, timedelta, timezone
+
+    async with TestSessionLocal() as db:
+        row = UserSession(
+            user_id=user.id,
+            refresh_hash=session_service.hash_refresh_token(uuid.uuid4().hex),
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            auth_method=method,
+            mfa_verified=mfa_verified,
+        )
+        db.add(row)
+        await db.commit()
+        return session_service.write_access_token(user, row.id)
+
+
+@pytest_asyncio.fixture
+async def test_user(session: AsyncSession, clean_db) -> User:
+    """Create a test user with an auto-created Personal workspace.
+
+    Pre-creates the workspace so the auto-stamp listener (registered on
+    the financial models) can resolve `workspace_id` from `user_id` for
+    legacy test fixtures that construct rows without setting it.
+    """
+    import bcrypt as _bcrypt
+
+    hashed = _bcrypt.hashpw(b"testpass123", _bcrypt.gensalt()).decode()
+    user = User(
+        id=uuid.uuid4(),
+        email="test@example.com",
+        hashed_password=hashed,
+        is_active=True,
+        is_superuser=False,
+        is_verified=True,
+        preferences={
+            "language": "pt-BR",
+            "date_format": "DD/MM/YYYY",
+            "timezone": "America/Sao_Paulo",
+            "currency_display": "BRL",
+        },
+    )
+    session.add(user)
+    await session.flush()
+
+    workspace = Workspace(
+        id=uuid.uuid4(),
+        name="Pessoal",
+        kind="personal",
+        created_by_user_id=user.id,
+        default_currency="BRL",
+        locale="pt-BR",
+    )
+    session.add(workspace)
+    await session.flush()
+    session.add(
+        WorkspaceMember(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            user_id=user.id,
+            role="owner",
+        )
+    )
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+@pytest_asyncio.fixture
+async def test_workspace(session: AsyncSession, test_user: User) -> Workspace:
+    """Return the test user's default workspace (created by `test_user`)."""
+    from sqlalchemy import select as _select
+    result = await session.execute(
+        _select(Workspace)
+        .join(WorkspaceMember, WorkspaceMember.workspace_id == Workspace.id)
+        .where(WorkspaceMember.user_id == test_user.id)
+        .limit(1)
+    )
+    ws = result.scalar_one()
+    return ws
+
+
+@pytest_asyncio.fixture
+async def auth_token(client: AsyncClient, test_user: User) -> str:
+    """Get an auth token for the test user."""
+    response = await client.post(
+        "/api/auth/login",
+        data={"username": "test@example.com", "password": "testpass123"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200, f"Login failed: {response.text}"
+    return response.json()["access_token"]
+
+
+@pytest_asyncio.fixture
+async def auth_headers(auth_token: str) -> dict:
+    """Auth headers for authenticated requests."""
+    return {"Authorization": f"Bearer {auth_token}"}
+
+
+@pytest_asyncio.fixture
+async def test_superuser(session: AsyncSession, clean_db) -> User:
+    """Create a test superuser (admin)."""
+    import bcrypt as _bcrypt
+
+    hashed = _bcrypt.hashpw(b"adminpass123", _bcrypt.gensalt()).decode()
+    user = User(
+        id=uuid.uuid4(),
+        email="admin@example.com",
+        hashed_password=hashed,
+        is_active=True,
+        is_superuser=True,
+        is_verified=True,
+        preferences={
+            "language": "en",
+            "date_format": "MM/DD/YYYY",
+            "timezone": "UTC",
+            "currency_display": "USD",
+        },
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+@pytest_asyncio.fixture
+async def admin_auth_token(client: AsyncClient, test_superuser: User) -> str:
+    """Get an auth token for the superuser."""
+    response = await client.post(
+        "/api/auth/login",
+        data={"username": "admin@example.com", "password": "adminpass123"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200, f"Admin login failed: {response.text}"
+    return response.json()["access_token"]
+
+
+@pytest_asyncio.fixture
+async def admin_auth_headers(admin_auth_token: str) -> dict:
+    """Auth headers for admin requests."""
+    return {"Authorization": f"Bearer {admin_auth_token}"}
+
+
+@pytest_asyncio.fixture
+async def viewer_auth_headers(
+    session: AsyncSession, client: AsyncClient, test_workspace: Workspace
+) -> dict:
+    """A second user who is a `viewer` member of the test workspace.
+
+    Read-only by role. Exists so the write gate can be exercised over HTTP:
+    the enforcement is a dependency wrapper, so asserting it at the service
+    layer alone leaves the wiring between route and role untested — which is
+    exactly the gap that let an audit conclude the gate was missing when it
+    was not.
+    """
+    import bcrypt as _bcrypt
+
+    user = User(
+        id=uuid.uuid4(),
+        email="viewer-role@example.com",
+        hashed_password=_bcrypt.hashpw(b"viewerpass123", _bcrypt.gensalt()).decode(),
+        is_active=True,
+        is_superuser=False,
+        is_verified=True,
+    )
+    session.add(user)
+    await session.flush()
+    session.add(
+        WorkspaceMember(
+            id=uuid.uuid4(),
+            workspace_id=test_workspace.id,
+            user_id=user.id,
+            role="viewer",
+        )
+    )
+    await session.commit()
+
+    response = await client.post(
+        "/api/auth/login",
+        data={"username": "viewer-role@example.com", "password": "viewerpass123"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200, f"Viewer login failed: {response.text}"
+    return {
+        "Authorization": f"Bearer {response.json()['access_token']}",
+        # Explicit, because the viewer's *default* workspace resolution would
+        # otherwise decide which workspace this request lands in.
+        "X-Workspace-Id": str(test_workspace.id),
+    }
+
+
+@pytest_asyncio.fixture
+async def test_categories(session: AsyncSession, test_user: User) -> list[Category]:
+    """Create test categories."""
+    categories = []
+    for name, icon, color in [
+        ("Alimentação", "🍔", "#F59E0B"),
+        ("Transporte", "🚗", "#3B82F6"),
+        ("Receita", "💼", "#22C55E"),
+    ]:
+        cat = Category(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            name=name,
+            icon=icon,
+            color=color,
+            is_system=True,
+        )
+        session.add(cat)
+        categories.append(cat)
+    await session.commit()
+    for cat in categories:
+        await session.refresh(cat)
+    return categories
+
+
+@pytest_asyncio.fixture
+async def test_connection(session: AsyncSession, test_user: User) -> BankConnection:
+    """Create a test bank connection."""
+    conn = BankConnection(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        provider="test",
+        external_id="ext-123",
+        institution_name="Banco Teste",
+        credentials={"token": "fake"},
+        status="active",
+        last_sync_at=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(conn)
+    await session.commit()
+    await session.refresh(conn)
+    return conn
+
+
+@pytest_asyncio.fixture
+async def test_account(session: AsyncSession, test_user: User, test_connection: BankConnection) -> Account:
+    """Create a test account."""
+    account = Account(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        connection_id=test_connection.id,
+        external_id="acc-ext-123",
+        name="Conta Corrente",
+        type="checking",
+        balance=Decimal("1500.00"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.commit()
+    await session.refresh(account)
+    return account
+
+
+@pytest_asyncio.fixture
+async def test_transactions(
+    session: AsyncSession, test_user: User, test_account: Account, test_categories: list[Category]
+) -> list[Transaction]:
+    """Create test transactions in the current month so tests don't break as time passes."""
+    today = date.today()
+    transactions = []
+    data = [
+        ("UBER TRIP", Decimal("25.50"), today.replace(day=min(3, today.day)), "debit", test_categories[1].id),
+        ("IFOOD RESTAURANTE", Decimal("45.00"), today.replace(day=min(4, today.day)), "debit", test_categories[0].id),
+        ("SALARIO FEV", Decimal("8000.00"), today.replace(day=min(2, today.day)), "credit", test_categories[2].id),
+        ("PIX RECEBIDO", Decimal("150.00"), today.replace(day=min(5, today.day)), "credit", None),
+        ("NETFLIX", Decimal("39.90"), today.replace(day=1), "debit", None),
+    ]
+    for desc, amount, dt, typ, cat_id in data:
+        txn = Transaction(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            account_id=test_account.id,
+            category_id=cat_id,
+            description=desc,
+            amount=amount,
+            date=dt,
+            type=typ,
+            source="manual",
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(txn)
+        transactions.append(txn)
+    await session.commit()
+    for txn in transactions:
+        await session.refresh(txn)
+    return transactions
+
+
+@pytest_asyncio.fixture
+async def test_rules(
+    session: AsyncSession, test_user: User, test_categories: list[Category]
+) -> list[Rule]:
+    """Create test categorization rules using the new Rule model."""
+    rules = []
+    rule_data = [
+        (
+            "UBER rule",
+            "or",
+            [{"field": "description", "op": "starts_with", "value": "UBER"}],
+            [{"op": "set_category", "value": str(test_categories[1].id)}],
+            10,
+        ),
+        (
+            "IFOOD rule",
+            "or",
+            [{"field": "description", "op": "starts_with", "value": "IFOOD"}],
+            [{"op": "set_category", "value": str(test_categories[0].id)}],
+            10,
+        ),
+        (
+            "SALARIO rule",
+            "and",
+            [{"field": "description", "op": "contains", "value": "SALARIO"}],
+            [{"op": "set_category", "value": str(test_categories[2].id)}],
+            10,
+        ),
+    ]
+    for name, conditions_op, conditions, actions, priority in rule_data:
+        rule = Rule(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            name=name,
+            conditions_op=conditions_op,
+            conditions=conditions,
+            actions=actions,
+            priority=priority,
+            is_active=True,
+        )
+        session.add(rule)
+        rules.append(rule)
+    await session.commit()
+    for rule in rules:
+        await session.refresh(rule)
+    return rules
+
+
+@pytest_asyncio.fixture
+async def test_agent(session: AsyncSession, test_user: User) -> Agent:
+    """A baseline agent for tests."""
+    agent = Agent(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        name="Test Agent",
+        description="A test agent",
+        system_prompt="You are a helpful assistant.",
+        provider="openai",
+        model="gpt-4o-mini",
+        temperature=0.4,
+    )
+    session.add(agent)
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+@pytest_asyncio.fixture
+async def test_conversation(session: AsyncSession, test_user: User, test_agent: Agent) -> Conversation:
+    conv = Conversation(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        agent_id=test_agent.id,
+        channel="web",
+    )
+    session.add(conv)
+    await session.commit()
+    await session.refresh(conv)
+    return conv
+
+
+@pytest_asyncio.fixture
+async def test_user_with_2fa(session: AsyncSession, clean_db) -> User:
+    """Create a test user with 2FA enabled."""
+    import bcrypt as _bcrypt
+    import pyotp
+
+    hashed = _bcrypt.hashpw(b"testpass123", _bcrypt.gensalt()).decode()
+    totp_secret = pyotp.random_base32()
+    user = User(
+        id=uuid.uuid4(),
+        email="2fa@example.com",
+        hashed_password=hashed,
+        is_active=True,
+        is_superuser=False,
+        is_verified=True,
+        totp_secret=totp_secret,
+        is_2fa_enabled=True,
+        preferences={
+            "language": "en",
+            "date_format": "MM/DD/YYYY",
+            "timezone": "UTC",
+            "currency_display": "USD",
+        },
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+@pytest.fixture(autouse=True)
+def _mock_redis():
+    """Provide a no-op Redis mock so rate limiting never blocks tests."""
+    mock = AsyncMock()
+    # Pipeline commands are synchronous/chained on redis-py's pipeline; only
+    # execute() is awaited. Match that contract so requests create no unawaited
+    # mock coroutines, while still reporting zero prior requests.
+    pipe_mock = MagicMock()
+    pipe_mock.zremrangebyscore = MagicMock(return_value=pipe_mock)
+    pipe_mock.zcard = MagicMock(return_value=pipe_mock)
+    pipe_mock.zadd = MagicMock(return_value=pipe_mock)
+    pipe_mock.expire = MagicMock(return_value=pipe_mock)
+    pipe_mock.execute = AsyncMock(return_value=[0, 0, True, True])
+    mock.pipeline = lambda: pipe_mock
+    # Key-value ops for 2FA temp tokens
+    mock.get = AsyncMock(return_value=None)
+    keys: set = set()
+
+    async def _set(key, value, ex=None, px=None, nx=False, **kwargs):
+        # Like Redis: SET ... NX does nothing (None) when the key is there.
+        if nx and key in keys:
+            return None
+        keys.add(key)
+        return True
+
+    mock.set = _set
+
+    async def _delete(*names):
+        # Like Redis: DEL returns how many of the keys were there, and frees them for a later SET ... NX.
+        found = [name for name in names if name in keys]
+        keys.difference_update(found)
+        return len(found)
+
+    mock.delete = _delete
+
+    async def _fake_get_redis():
+        return mock
+
+    # Reset the cached singleton so no real Redis connection leaks into tests
+    import app.core.redis as redis_mod
+    original = redis_mod._redis
+    redis_mod._redis = None
+
+    with patch("app.core.redis.get_redis", _fake_get_redis), \
+         patch("app.core.rate_limit.get_redis", _fake_get_redis), \
+         patch("app.api.custom_auth.get_redis", _fake_get_redis), \
+         patch("app.api.two_factor.get_redis", _fake_get_redis), \
+         patch("app.services.access_log_service.get_redis", _fake_get_redis):
+        yield mock
+
+    redis_mod._redis = original
+
+
+@pytest.fixture(autouse=True)
+def _no_external_fx_sync():
+    """Prevent tests from hitting the real OpenExchangeRates API."""
+    with patch("app.services.fx_rate_service._provider") as mock_provider:
+        mock_provider.name = "test"
+        mock_provider.fetch_latest = AsyncMock(return_value={})
+        mock_provider.fetch_historical = AsyncMock(return_value={})
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_registry():
+    """Reset the provider registry so local env config doesn't leak into tests."""
+    from app.providers import _PROVIDERS
+
+    original = dict(_PROVIDERS)
+    _PROVIDERS.clear()
+    yield
+    _PROVIDERS.clear()
+    _PROVIDERS.update(original)

@@ -1,0 +1,24 @@
+{{- if .Values.backup.enabled }}
+# E2 — armazenamento dos backups: dumps (dumps/), base backups (base/) e WAL arquivado (wal/).
+# Montado no StatefulSet do PostgreSQL (archive_command) e nos CronJobs. Com ReadWriteOnce
+# todos precisam cair no mesmo nó; em clusters multi-nó use uma classe RWX
+# (backup.storage.accessModes) ou um nodeSelector.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "syncrofin.fullname" . }}-backups
+  labels:
+    {{- include "syncrofin.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.backup.storage.accessModes | nindent 4 }}
+  {{- if .Values.backup.storage.storageClass }}
+  storageClassName: {{ .Values.backup.storage.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.storage.size }}
+{{- end }}

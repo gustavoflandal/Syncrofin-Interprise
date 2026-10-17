@@ -1,0 +1,68 @@
+{{- if and .Values.backup.enabled .Values.postgresql.enabled }}
+# E2 — base backup semanal (pg_basebackup, tar+gzip, WAL incluso) + poda do WAL arquivado.
+# Com o WAL de /backups/wal (archive_command do StatefulSet) permite PITR.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "syncrofin.fullname" . }}-db-basebackup
+  labels:
+    {{- include "syncrofin.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.basebackup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "syncrofin.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: basebackup
+              image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+              imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  mkdir -p /backups/base
+                  DEST=/backups/base/base_$(date +%Y%m%d_%H%M%S)
+                  echo "base backup em $DEST"
+                  # .partial: o restore_drill.sh ignora backups incompletos
+                  if ! pg_basebackup -D "$DEST.partial" -Ft -z -Xs -P; then
+                    rm -rf "$DEST.partial"; exit 1
+                  fi
+                  mv "$DEST.partial" "$DEST"
+                  # poda: mantém KEEP_COUNT base backups
+                  ls -1dt /backups/base/base_* | grep -v '\.partial$' | tail -n +$((KEEP_COUNT+1)) | xargs -r rm -rf || true
+                  # WAL mais antigo que o base backup mais velho retido (+1 h de folga) não serve mais
+                  OLDEST=$(ls -1dt /backups/base/base_* | grep -v '\.partial$' | tail -n1)
+                  AGE_MIN=$(( ($(date +%s) - $(stat -c %Y "$OLDEST")) / 60 + 60 ))
+                  find /backups/wal -type f -mmin +"$AGE_MIN" -delete 2>/dev/null || true
+                  echo "base backup concluído"
+              env:
+                - name: PGHOST
+                  value: {{ include "syncrofin.fullname" . }}-postgresql
+                - name: PGUSER
+                  value: postgres
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "syncrofin.fullname" . }}-postgresql
+                      key: password
+                - name: KEEP_COUNT
+                  value: {{ .Values.backup.basebackup.keepCount | quote }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "syncrofin.fullname" . }}-backups
+{{- end }}
